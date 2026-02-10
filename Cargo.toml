@@ -1,0 +1,17 @@
+[package]
+name = "rogue"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.101"
+chrono = "0.4.43"
+clap = { version = "4.5.57", features = ["derive"] }
+comfy-table = "7.2.2"
+env_logger = "0.11.8"
+is_elevated = "0.1.2"
+log = "0.4.29"
+wildmatch = "2.6.1"
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_SystemServices", "Win32_System_Time"] }
+windows-sys = { version = "0.59.0", features = ["Win32_Foundation", "Win32_System_Time"] }
+winreg = "0.55.0"
