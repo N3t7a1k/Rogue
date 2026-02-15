@@ -7,8 +7,7 @@ pub mod artifacts;
 pub mod storage;
 pub mod types;
 pub mod utils;
-mod usb_cli;
-mod time_cli;
+mod cli;
 
 use storage::Storage;
 
@@ -33,12 +32,12 @@ enum Commands {
     /// Manage USB artifacts
     Usb {
         #[command(subcommand)]
-        action: usb_cli::Commands,
+        action: cli::usb::Commands,
     },
-    /// Time Stomping
-    Time {
+    /// Manage file artifacts (timestamps, ownership)
+    File {
         #[command(subcommand)]
-        action: time_cli::Commands,
+        action: cli::file::Commands,
     },
 }
 
@@ -61,8 +60,8 @@ fn main() -> Result<()> {
     }
 
     match cli.command {
-        Commands::Usb { action } => usb_cli::run(action)?,
-        Commands::Time { action } => time_cli::run(action)?,
+        Commands::Usb { action } => cli::usb::run(action)?,
+        Commands::File { action } => cli::file::run(action)?,
     }
 
     Ok(())

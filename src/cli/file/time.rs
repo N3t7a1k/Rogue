@@ -1,10 +1,12 @@
-use crate::artifacts::time;
-use crate::storage::Storage;
+use crate::{
+    artifacts::file::time,
+    storage::Storage,
+};
 use clap::Subcommand;
 use chrono::Local;
 use anyhow::Result;
 use comfy_table::{Table, presets::UTF8_FULL, modifiers::UTF8_ROUND_CORNERS, ContentArrangement, Cell, Color, Attribute};
-use log::{info, warn, error};
+use log::{info, warn};
 
 #[derive(Subcommand, Debug)]
 pub enum Commands {
@@ -53,12 +55,6 @@ pub enum SetCommands {
 }
 
 pub fn run(command: Commands) -> Result<()> {
-    let storage = Storage::instance();
-    if !storage.is_admin && storage.as_system {
-        error!("Administrator privilege required for system option.");
-        return Ok(());
-    }
-
     match command {
         Commands::Get { pattern } => print_timestamps(pattern),
         

@@ -1,5 +1,7 @@
-use crate::artifacts::usb;
-use crate::storage::Storage;
+use crate::{
+    artifacts::usb,
+    storage::Storage,
+};
 use anyhow::Result;
 use clap::Subcommand;
 use chrono::Local;
@@ -41,7 +43,7 @@ pub fn run(action: Commands) -> Result<()> {
         
         Commands::Delete { command } => {
             if !Storage::instance().dry_run && !Storage::instance().is_admin {
-                error!("Deleting USB history requires administrator privileges.");
+                error!("Deleting USB history requires Administrator privileges.");
                 return Ok(());
             }
             match command {
@@ -78,6 +80,7 @@ fn print_usb_devices() -> Result<()> {
             .set_content_arrangement(ContentArrangement::Dynamic);
 
         table.set_header(vec![
+            Cell::new("Type").add_attribute(Attribute::Bold).fg(Color::Green),
             Cell::new("Serial Number").add_attribute(Attribute::Bold).fg(Color::Green),
             Cell::new("Device Name").add_attribute(Attribute::Bold).fg(Color::Green),
             Cell::new("Last Activity").add_attribute(Attribute::Bold).fg(Color::Green),
@@ -86,6 +89,7 @@ fn print_usb_devices() -> Result<()> {
 
         for device in usb_devices {
             table.add_row(vec![
+                Cell::new(&device.device_type),
                 Cell::new(&device.serial),
                 Cell::new(&device.name),
                 Cell::new(device.last_write_time.with_timezone(&Local).format("%Y-%m-%d %H:%M:%S%.3f")),

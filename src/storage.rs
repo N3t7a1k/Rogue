@@ -1,6 +1,8 @@
-use std::sync::OnceLock;
-use std::path::PathBuf;
-use std::env;
+use std::{
+    env,
+    path::PathBuf,
+    sync::OnceLock,
+};
 use is_elevated::is_elevated;
 
 #[derive(Debug)]

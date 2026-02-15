@@ -1,67 +1,273 @@
-use crate::utils;
-use crate::storage::Storage;
+use crate::{
+    utils,
+    storage::Storage,
+};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use log::{info, debug, error};
-use std::fs::{self, File};
-use std::io::{BufRead, BufReader};
+use std::{
+    fs::{self, File},
+    io::{BufRead, BufReader},
+    collections::HashSet,
+};
 use wildmatch::WildMatch;
-use winreg::enums::*;
-use winreg::RegKey;
+use winreg::{
+    enums::*,
+    RegKey,
+};
 
-#[derive(Debug)]
+const CM_DEVCAP_REMOVABLE: u32 = 0x00000004;
+
+#[derive(Debug, Clone)]
 pub struct UsbDevice {
+    pub device_type: String,
     pub name: String,
     pub serial: String,
     pub registry_path: String,
     pub last_write_time: DateTime<Utc>, 
 }
 
-pub fn get_usb_devices() -> Result<Vec<UsbDevice>> {
-    let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
-    let usbstor_path = "SYSTEM\\CurrentControlSet\\Enum\\USBSTOR";
+fn is_removable(key: &RegKey) -> bool {
+    let caps: u32 = match key.get_value("Capabilities") {
+        Ok(val) => val,
+        Err(_) => return false,
+    };
+    (caps & CM_DEVCAP_REMOVABLE) != 0
+}
 
-    let usbstor = match hklm.open_subkey(usbstor_path) {
+fn scan_enum_key(subpath: &str, type_label: &str, check_removable: bool) -> Result<Vec<UsbDevice>> {
+    let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
+    let base_path = format!("SYSTEM\\CurrentControlSet\\Enum\\{}", subpath);
+
+    let base_key = match hklm.open_subkey(&base_path) {
         Ok(key) => key,
         Err(_) => return Ok(vec![]),
     };
 
-    let mut devices = Vec::new();
+    let mut found_devices = Vec::new();
 
-    for vendor_key_name in usbstor.enum_keys().flatten() {
-        if vendor_key_name.is_empty() { continue; }
+    for group_key_name in base_key.enum_keys().flatten() {
+        if group_key_name.is_empty() { continue; }
         
-        let vendor_path = match usbstor.open_subkey(&vendor_key_name) {
+        let group_key = match base_key.open_subkey(&group_key_name) {
             Ok(k) => k,
             Err(_) => continue,
         };
 
-        for serial_key_name in vendor_path.enum_keys().flatten() {
+        for serial_key_name in group_key.enum_keys().flatten() {
             if serial_key_name.is_empty() { continue; }
 
-            let instance_key = match vendor_path.open_subkey(&serial_key_name) {
+            let instance_key = match group_key.open_subkey(&serial_key_name) {
                 Ok(k) => k,
                 Err(_) => continue,
             };
+
+            if check_removable {
+                if !is_removable(&instance_key) {
+                    continue; 
+                }
+            }
+
+            if type_label == "USB" {
+                let service: String = instance_key.get_value::<String, _>("Service").unwrap_or_default().to_lowercase();
+                let class: String = instance_key.get_value::<String, _>("Class").unwrap_or_default().to_lowercase();
+                let desc: String = instance_key.get_value::<String, _>("DeviceDesc").unwrap_or_default().to_lowercase();
+                let is_storage = service == "usbstor" || 
+                                 service.contains("wudfrd") || 
+                                 class == "usbdevice" || 
+                                 class == "wpd" || 
+                                 desc.contains("mass storage");
+                
+                if !is_storage { continue; }
+            }
             
             let info = instance_key.query_info()?;
             let sys_time = info.get_last_write_time_system();
-            let datetime = utils::systemtime_to_datetime(&sys_time);
+            let datetime = utils::time::systemtime_to_datetime(&sys_time);
 
-            let name: String = instance_key.get_value("FriendlyName")
-                .or_else(|_| instance_key.get_value("DeviceDesc"))
-                .unwrap_or_else(|_| "Unknown Device".to_string());
+            let name: String = instance_key.get_value::<String, _>("FriendlyName")
+                .or_else(|_| instance_key.get_value::<String, _>("DeviceDesc"))
+                .unwrap_or_else(|_| format!("Unknown Device ({})", group_key_name));
 
-            devices.push(UsbDevice {
-                name,
+            let final_name = if name.starts_with('@') {
+                let desc: String = instance_key.get_value::<String, _>("DeviceDesc").unwrap_or_default();
+                if !desc.is_empty() {
+                    let clean_desc = desc.split(';').last().unwrap_or(&desc);
+                    clean_desc.to_string()
+                } else {
+                    name
+                }
+            } else {
+                name
+            };
+
+            found_devices.push(UsbDevice {
+                device_type: type_label.to_string(),
+                name: final_name,
                 serial: serial_key_name.clone(),
-                registry_path: format!("HKLM\\{}\\{}\\{}", usbstor_path, vendor_key_name, serial_key_name),
+                registry_path: format!("HKLM\\{}\\{}\\{}", base_path, group_key_name, serial_key_name),
                 last_write_time: datetime,
             });
         }
     }
+
+    Ok(found_devices)
+}
+
+fn scan_wpd_devices() -> Result<Vec<UsbDevice>> {
+    let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
+    let wpd_path = "SOFTWARE\\Microsoft\\Windows Portable Devices\\Devices";
+
+    let wpd_key = match hklm.open_subkey(wpd_path) {
+        Ok(k) => k,
+        Err(_) => return Ok(vec![]),
+    };
+
+    let mut found_devices = Vec::new();
+
+    for device_id in wpd_key.enum_keys().flatten() {
+        if device_id.is_empty() { continue; }
+
+        let device_key = match wpd_key.open_subkey(&device_id) {
+            Ok(k) => k,
+            Err(_) => continue,
+        };
+
+        let info = device_key.query_info()?;
+        let sys_time = info.get_last_write_time_system();
+        let datetime = utils::time::systemtime_to_datetime(&sys_time);
+
+        let name: String = device_key.get_value::<String, _>("FriendlyName")
+            .unwrap_or_else(|_| "Unknown Portable Device".to_string());
+
+        let clean_serial = if let Some(idx) = device_id.rfind('#') {
+            let last_part = &device_id[idx+1..];
+
+            if last_part.starts_with('{') && last_part.ends_with('}') {
+                let temp_id = &device_id[..idx];
+                if let Some(second_idx) = temp_id.rfind('#') {
+                    temp_id[second_idx+1..].to_string()
+                } else {
+                    last_part.to_string()
+                }
+            } else {
+                last_part.to_string()
+            }
+        } else {
+            device_id.clone()
+        };
+
+        found_devices.push(UsbDevice {
+            device_type: "WPD".to_string(),
+            name,
+            serial: clean_serial,
+            registry_path: format!("HKLM\\{}\\{}", wpd_path, device_id),
+            last_write_time: datetime,
+        });
+    }
+
+    Ok(found_devices)
+}
+
+pub fn get_usb_devices() -> Result<Vec<UsbDevice>> {
+    let mut all_devices = Vec::new();
+    let mut known_serials = HashSet::new();
+
+    if let Ok(mut devs) = scan_enum_key("USBSTOR", "USBSTOR", false) {
+        for dev in &devs {
+            let core_serial = dev.serial.split('&').next().unwrap_or(&dev.serial).to_string();
+            known_serials.insert(core_serial);
+        }
+        all_devices.append(&mut devs);
+    }
+
+    if let Ok(mut devs) = scan_enum_key("SCSI", "SCSI", true) {
+        for dev in &devs {
+            let core_serial = dev.serial.split('&').next().unwrap_or(&dev.serial).to_string();
+            known_serials.insert(core_serial);
+        }
+        all_devices.append(&mut devs);
+    }
+
+    if let Ok(mut devs) = scan_wpd_devices() {
+        all_devices.append(&mut devs);
+    }
+
+    if let Ok(devs) = scan_enum_key("USB", "USB", false) { 
+         for dev in devs {
+             let serial_check = dev.serial.clone();
+             if known_serials.contains(&serial_check) {
+                 continue;
+             }
+             all_devices.push(dev);
+         }
+    }
+
+    all_devices.sort_by(|a, b| b.last_write_time.cmp(&a.last_write_time));
+
+    Ok(all_devices)
+}
+
+fn delete_with_parent_cleanup(full_path: &str) -> Result<()> {
+    utils::system::delete_registry_key(full_path, true)?;
+
+    let (parent_path, _) = match full_path.rsplit_once('\\') {
+        Some(res) => res,
+        None => return Ok(()),
+    };
+
+    if !parent_path.contains("CurrentControlSet\\Enum") {
+        return Ok(());
+    }
+
+    let relative_parent = parent_path.trim_start_matches("HKLM\\");
+    let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
     
-    Ok(devices)
+    if let Ok(parent_key) = hklm.open_subkey(relative_parent) {
+        if parent_key.enum_keys().count() == 0 {
+            debug!("Parent key is now empty. Cleaning up parent: {}", parent_path);
+            if let Err(e) = utils::system::delete_registry_key(parent_path, true) {
+                debug!("Failed to clean empty parent (might be locked): {}", e);
+            } else {
+                debug!("Successfully cleaned empty parent.");
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn clean_parent_usb_device(serial: &str) -> Result<()> {
+    let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
+    let usb_root_path = "SYSTEM\\CurrentControlSet\\Enum\\USB";
+    
+    let usb_root = match hklm.open_subkey(usb_root_path) {
+        Ok(k) => k,
+        Err(_) => return Ok(()),
+    };
+
+    let mut targets_to_delete = Vec::new();
+
+    for vid_pid in usb_root.enum_keys().flatten() {
+        if let Ok(vid_pid_key) = usb_root.open_subkey(&vid_pid) {
+            for instance_id in vid_pid_key.enum_keys().flatten() {
+                if instance_id.eq_ignore_ascii_case(serial) {
+                    let full_path = format!("HKLM\\{}\\{}\\{}", usb_root_path, vid_pid, instance_id);
+                    targets_to_delete.push(full_path);
+                }
+            }
+        }
+    }
+
+    for target_path in targets_to_delete {
+        debug!("Found parent USB device trace: {}. Deleting...", target_path);
+        
+        if let Err(e) = delete_with_parent_cleanup(&target_path) {
+            debug!("Failed to delete parent USB key: {}", e);
+        }
+    }
+
+    Ok(())
 }
 
 fn clean_mounted_devices(serial: &str) -> Result<()> {
@@ -76,7 +282,7 @@ fn clean_mounted_devices(serial: &str) -> Result<()> {
             if Storage::instance().dry_run { info!("Would delete value: {} from {}.", value_name, hklm_path); continue; }
             let cmd = format!("cmd /c reg delete \"{}\" /v \"{}\" /f", hklm_path, value_name);
             debug!("Found artifact in MountedDevices. Deleting value: {}.", value_name);
-            let _ = utils::run_scheduled_command(&cmd, true, 0);
+            let _ = utils::system::run_scheduled_command(&cmd, true, 0);
         }
     }
     Ok(())
@@ -92,7 +298,7 @@ fn clean_device_classes(serial: &str) -> Result<()> {
             for sub in guid_key.enum_keys().map(|x| x.unwrap_or_default()) {
                 if sub.contains(serial) {
                     let full = format!("HKLM\\{}\\{}", guid_path, sub);
-                    let _ = utils::delete_registry_key(&full, true);
+                    let _ = utils::system::delete_registry_key(&full, true);
                 }
             }
         }
@@ -143,19 +349,17 @@ pub fn clean_devices(field_type: &str, pattern: &str) -> Result<usize> {
     let mut count = 0;
     
     let matcher = WildMatch::new(pattern);
-    info!("Deleting USB devices matching pattern: '{}'...", pattern);
+    info!("Starting artifact wipe. Target pattern: '{}' ({})", pattern, field_type);
 
     for dev in devices {
-        let target_value = match field_type {
-            "name" => &dev.name,
-            "serial" => &dev.serial,
+        let is_match = match field_type {
+            "name" => matcher.matches(&dev.name),
+            "serial" => matcher.matches(&dev.serial),
             _ => continue,
         };
 
-        if matcher.matches(target_value) {
-            let mut delete_path = dev.registry_path.clone();
-
-            info!("Deleting USB device: {}.", dev.name);
+        if is_match {
+            info!("Target identified: {} [{}] (Serial: {})", dev.name, dev.device_type, dev.serial);
 
             if let Err(e) = clean_mounted_devices(&dev.serial) {
                 debug!("Failed to clean MountedDevices: {}.", e);
@@ -167,27 +371,43 @@ pub fn clean_devices(field_type: &str, pattern: &str) -> Result<usize> {
                 debug!("Failed to clean setupapi.dev.log: {}.", e);
             }
 
-            if let Some((parent_path, _)) = dev.registry_path.rsplit_once('\\') {
-                let relative_parent = parent_path.trim_start_matches("HKLM\\");
+            if dev.device_type == "USBSTOR" || dev.device_type == "SCSI" || dev.device_type == "USB" {
+                if let Err(e) = delete_with_parent_cleanup(&dev.registry_path) {
+                     error!("Failed to delete registry key {}: {}", dev.registry_path, e);
+                     continue;
+                }
                 
-                let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
-                if let Ok(parent_key) = hklm.open_subkey(relative_parent) {
-                    let sibling_count = parent_key.enum_keys().count();
-                    
-                    if sibling_count <= 1 {
-                        debug!("Target is the only child. Upgrading target to Parent: {}.", parent_path);
-                        delete_path = parent_path.to_string();
+                if dev.device_type != "USB" {
+                    let core_serial = dev.serial.split('&').next().unwrap_or(&dev.serial);
+                    if let Err(e) = clean_parent_usb_device(core_serial) {
+                        debug!("Parent cleanup warning: {}", e);
                     }
                 }
-            }
 
-            if let Err(e) = utils::delete_registry_key(&delete_path, true) {
-                error!("Failed to delete USB device {}: {}.", dev.name, e);
-            } else {
                 count += 1;
-                info!("Successfully deleted USB device: {}.", dev.name);
+                info!("Successfully wiped artifact: {}", dev.name);
+            }
+            else if dev.device_type == "WPD" {
+                if let Err(e) = utils::system::delete_registry_key(&dev.registry_path, true) {
+                    error!("Failed to delete WPD registry key: {}", e);
+                    continue; 
+                }
+
+                if let Err(e) = clean_parent_usb_device(&dev.serial) {
+                     debug!("WPD Hardware trace cleanup warning: {}", e);
+                }
+
+                count += 1;
+                info!("Successfully wiped WPD artifact: {}", dev.name);
             }
         }
+    }
+
+    if count == 0 {
+        info!("No devices found matching the pattern.");
+    } else {
+        info!("Wipe operation completed. {} devices cleaned.", count);
+        info!("IMPORTANT: Please REBOOT your system to allow Windows to re-detect the devices correctly.");
     }
     
     Ok(count)
